@@ -1,0 +1,295 @@
+<?php
+ini_set('include_path', '.');
+
+require_once('env-parser.php');
+require_once('file-util.php');
+require_once('db-util.php');
+require_once('app-util.php');
+require_once('upgrade-app.php');
+require_once('idna_convert.class.php');
+$IDN = new idna_convert();
+
+function admin_password_crypt($value) {
+	return md5($value);
+}
+
+function update_user($userData = array(), $rootDir) {
+	require_once($rootDir . '/wp-config.php');
+	require_once($rootDir . '/wp-includes/functions.php');
+	require_once($rootDir . '/wp-includes/pluggable.php');
+	require_once($rootDir . '/wp-includes/user.php');
+	wp_update_user(add_magic_quotes($userData));
+}
+
+function remove_genericons($rootDir) {
+	$themeDirectories = scandir($rootDir . '/wp-content/themes');
+	foreach ($themeDirectories as $directory) {
+		if (file_exists($rootDir . '/wp-content/themes/' . $directory . '/genericons/example.html')
+			&& false !== strpos(file_get_contents($rootDir . '/wp-content/themes/' . $directory . '/genericons/example.html'), '<title>Genericons</title>' )
+		) {
+			@unlink($rootDir . '/wp-content/themes/' . $directory . '/genericons/example.html');
+		}
+	}
+}
+
+$config_files = array('/' => array(array('wp-config.php.in', 'wp-config.php')), '/cgi-bin' => array());
+$schema_files = array('schema.sql' => 'main');
+$reconf_schema_files = array('reconfigure.sql' => 'main');
+$remove_schema_files = array('remove.sql' => 'main');
+
+$db_ids = array('main');
+$web_ids = array('blogs/media', 'wp-content', '/tmp', '/');
+$settings_params = array('admin_name', 'admin_email', 'title');
+$settings_enum_params = array('locale' => array('en-US' => 'en_US', 'ru-RU' => 'ru_RU', 'de-DE' => 'de_DE', 'nl-NL' => 'nl_NL', 'fr-FR' => 'fr_FR', 'es-ES' => 'es_ES', 'it-IT' => 'it_IT', 'ja-JP' => 'ja', 'tr-TR' => 'tr_TR', 'pl-PL' => 'pl_PL', 'zh-CN' => 'zh_CN', 'da-DK' => 'da_DK', 'zh-TW' => 'zh_TW', 'pt-BR' => 'pt_BR', 'pt-PT' => 'pt_PT', 'el-EL' => 'el', 'fi-FI' => 'fi', 'id-ID' => 'id_ID', 'ko-KR' => 'ko_KR', 'nb-NO' => 'nb_NO', 'sv-SE' => 'sv_SE', 'uk-UA' => 'uk', 'vi-Vi' => 'vi', 'th-Th' => 'th', 'tl' => 'tl'));
+$crypt_settings_params = array('admin_password');
+
+$scheme = fetch_env_var('BASE_URL_SCHEME');
+$host = $IDN->encode(fetch_env_var('BASE_URL_HOST'));
+$port = fetch_env_var('BASE_URL_PORT');
+$path = fetch_env_var('BASE_URL_PATH');
+
+$full = $scheme . '://' . $host . (($port !== NULL && strlen($port) > 0) ? ":$port" : '') . ($path[0] == '/' ? '' : '/') . $path;
+$my_root_url = $full;
+if ($my_root_url[strlen($my_root_url)-1] == '/') {
+	$my_root_url = substr($my_root_url, 0, strlen($my_root_url)-1);
+}
+
+$psa_modify_hash = get_psa_modify_hash();
+$psa_modify_hash['@@ROOT_URL@@'] = $my_root_url;
+$psa_modify_hash['@@BASE_URL_HOST@@'] = $host;
+
+$db_modify_hash = get_db_modify_hash($db_ids);
+$web_modify_hash = get_web_modify_hash($web_ids);
+$settings_modify_hash = get_settings_modify_hash($settings_params);
+$settings_enum_modify_hash = get_settings_enum_modify_hash($settings_enum_params);
+$crypt_settings_modify_hash = get_crypt_settings_modify_hash($crypt_settings_params);
+
+$additional_modify_hash = array_merge(get_additional_modify_hash(), $web_modify_hash);
+
+$db_modify_hash['@@DB_MAIN_PREFIX@@'] .= 'wp_';
+
+if (count($argv) < 2) {
+	print "Usage: configure (install | upgrade <version> | configure | remove)\n";
+	exit(1);
+}
+
+$command = $argv[1];
+
+define('APSCONFIGURE', 1);
+// Uncaught phpmailerException: Invalid address: wordpress@ in /wp-includes/class-phpmailer.php:946
+// Stack trace:
+// #0 /wp-includes/pluggable.php(352): PHPMailer->setFrom('wordpress@', 'WordPress')
+//
+// https://jira.plesk.ru/browse/APSI-537?focusedCommentId=2803384&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-2803384
+// Fix generate "from" email
+$_SERVER['SERVER_NAME'] = $psa_modify_hash['@@BASE_URL_HOST@@'];
+
+if ($command == 'upgrade') {
+	if ($argv[2] && $argv[3]) {
+		$config_files = array();
+		if (file_exists($psa_modify_hash['@@ROOT_DIR@@'] . '/wp-config.php')) {
+			file_intersperse_contents_update(
+				$psa_modify_hash['@@ROOT_DIR@@'] . '/wp-config.php',
+				$additional_modify_hash['@@AUTH_KEY@@'],
+				$additional_modify_hash['@@SECURE_AUTH_KEY@@'],
+				$additional_modify_hash['@@LOGGED_IN_KEY@@'],
+				$additional_modify_hash['@@NONCE_KEY@@'],
+				$additional_modify_hash['@@AUTH_SALT@@'],
+				$additional_modify_hash['@@SECURE_AUTH_SALT@@'],
+				$additional_modify_hash['@@LOGGED_IN_SALT@@'],
+				$additional_modify_hash['@@NONCE_SALT@@']
+			);
+		} else {
+			$config_files = array('/' => array(array('wp-config.php.in', 'wp-config.php')));
+		}
+
+		remove_genericons($psa_modify_hash['@@ROOT_DIR@@']);
+
+		$db_modify_hash['@@DB_MAIN_PREFIX@@'] = get_table_prefix($db_modify_hash,$psa_modify_hash, $db_ids);
+		$res = upgrade_app(
+				$argv[2],
+				$argv[3],
+				$config_files,
+				$db_ids,
+				$psa_modify_hash,
+				$db_modify_hash,
+				$settings_modify_hash,
+				$crypt_settings_modify_hash,
+				$settings_enum_modify_hash,
+				$additional_modify_hash
+		);
+		if ($res == 0) {
+			chdir($psa_modify_hash['@@ROOT_DIR@@'] . '/wp-admin');
+			$_GET['step'] = 'upgrade_db';
+			require_once($psa_modify_hash['@@ROOT_DIR@@'] . '/wp-admin/upgrade.php');
+			remove_lang();
+		}
+        fixWpFilesPermission($psa_modify_hash['@@ROOT_DIR@@']);
+		exit($res);
+	} else {
+		print "Error: upgrade version or release not specified.\n";
+		exit(1);
+	}
+}
+
+if ($command == 'install') {
+	configure($config_files, $schema_files, $db_ids, $psa_modify_hash, $db_modify_hash, $settings_modify_hash, $crypt_settings_modify_hash, $settings_enum_modify_hash, $additional_modify_hash);
+	$userData = array(
+		'ID' => '1',
+		'user_pass' => fetch_env_var('SETTINGS_admin_password'),
+	);
+	update_user($userData, $psa_modify_hash['@@ROOT_DIR@@']);
+	chdir($psa_modify_hash['@@ROOT_DIR@@'] . '/wp-admin');
+	$_GET['step'] = 'upgrade_db';
+	fixWpFilesPermission($psa_modify_hash['@@ROOT_DIR@@']);
+	require_once($psa_modify_hash['@@ROOT_DIR@@'] . '/wp-admin/upgrade.php');
+	exit(0);
+}
+
+if ($command == 'remove') {
+	remove_app($remove_schema_files, $db_ids, $psa_modify_hash, $db_modify_hash, $settings_modify_hash, $crypt_settings_modify_hash, $settings_enum_modify_hash, $additional_modify_hash);
+	exit(0);
+}
+
+if ($command == 'configure') {
+	if (file_exists($psa_modify_hash['@@ROOT_DIR@@'] . '/wp-config.php')) {
+		file_intersperse_contents(
+			$psa_modify_hash['@@ROOT_DIR@@'] . '/wp-config.php',
+			$additional_modify_hash['@@AUTH_KEY@@'],
+			$additional_modify_hash['@@SECURE_AUTH_KEY@@'],
+			$additional_modify_hash['@@LOGGED_IN_KEY@@'],
+			$additional_modify_hash['@@NONCE_KEY@@'],
+			$additional_modify_hash['@@AUTH_SALT@@'],
+			$additional_modify_hash['@@SECURE_AUTH_SALT@@'],
+			$additional_modify_hash['@@LOGGED_IN_SALT@@'],
+			$additional_modify_hash['@@NONCE_SALT@@'],
+			$psa_modify_hash['@@BASE_URL_PATH@@'],
+			$settings_enum_modify_hash['@@LOCALE@@'],
+			$db_modify_hash['@@DB_MAIN_LOGIN@@'],
+			$db_modify_hash['@@DB_MAIN_PASSWORD@@']
+		);
+	}
+	$config_files = array();
+	$db_modify_hash['@@DB_MAIN_PREFIX@@'] = get_table_prefix($db_modify_hash,$psa_modify_hash, $db_ids);
+	configure($config_files, $reconf_schema_files, $db_ids, $psa_modify_hash, $db_modify_hash, $settings_modify_hash, $crypt_settings_modify_hash, $settings_enum_modify_hash, $additional_modify_hash);
+	$userData = array(
+		'ID' => '1',
+		'user_login' => fetch_env_var('SETTINGS_admin_name'),
+		'user_nicename' => fetch_env_var('SETTINGS_admin_name'),
+		'display_name' => fetch_env_var('SETTINGS_admin_name'),
+		'user_pass' => fetch_env_var('SETTINGS_admin_password'),
+		'user_email' => fetch_env_var('SETTINGS_admin_email'),
+	);
+	update_user($userData, $psa_modify_hash['@@ROOT_DIR@@']);
+    fixWpFilesPermission($psa_modify_hash['@@ROOT_DIR@@']);
+	exit(0);
+}
+
+print "Error: unknown command $command.\n";
+exit(1);
+
+function wp_generate_password($length = 12) {
+	$chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^&*()";
+	$password = '';
+	for ($i = 0; $i < $length; $i++) {
+		$password .= substr($chars, mt_rand(0, strlen($chars) - 1), 1);
+	}
+	return $password;
+}
+
+function get_additional_modify_hash() {
+	$parameters = array();
+	$parameters['@@AUTH_KEY@@'] = wp_generate_password(64);
+	$parameters['@@SECURE_AUTH_KEY@@'] = wp_generate_password(64);
+	$parameters['@@LOGGED_IN_KEY@@'] = wp_generate_password(64);
+	$parameters['@@NONCE_KEY@@'] = wp_generate_password(64);
+	$parameters['@@AUTH_SALT@@'] = wp_generate_password(64);
+	$parameters['@@SECURE_AUTH_SALT@@'] = wp_generate_password(64);
+	$parameters['@@LOGGED_IN_SALT@@'] = wp_generate_password(64);
+	$parameters['@@NONCE_SALT@@'] = wp_generate_password(64);
+	return $parameters;
+}
+
+function get_table_prefix($db_modify_hash,$psa_modify_hash, $db_ids) {
+	$config_content = read_file($psa_modify_hash['@@ROOT_DIR@@'] . '/wp-config.php');
+	if (preg_match('#^\$table_prefix *= *[\'\"]([^\'\"]*)[\'\"]#m', $config_content, $mres)) {
+		$db_modify_hash['@@DB_MAIN_PREFIX@@'] = $mres[1];
+	}
+	return $db_modify_hash['@@DB_MAIN_PREFIX@@'];
+}
+
+function file_intersperse_contents($wpConfig, $authkey, $secureauthkey, $loggedinkey, $noncekey, $authsalt, $secureauthsalt, $loggedinsalt, $noncesalt, $baseurlpath, $locale, $dbUser, $dbPassword) {
+	// Fetch table prefix
+	$tablePrefixFile = file_get_contents($wpConfig);
+	if (preg_match_all("|table\_prefix *\= *\'(.*?)\' *\;|s", $tablePrefixFile, $array_match)) {
+ 		$prefix = $array_match[1][0];
+ 		$db_id = 'main';
+		$dbName = get_db_name($db_id);
+
+		$connect = mysql_db_connect(get_db_host($db_id), get_db_login($db_id), get_db_password($db_id),	$dbName, get_db_port($db_id));
+		//	check if table <DB_PREFIX>blogs exists
+		$res = mysqli_query($connect, "show create table `" . $prefix . "blogs`");
+		if ($res) {
+			//return $prefix;
+			$getFirstPathQuery = mysqli_query($connect, "SELECT `path` FROM `" . $prefix . "blogs` limit 1");
+			$getFirstPath = mysqli_fetch_row($getFirstPathQuery);
+			$getBlogPathQuery = mysqli_query($connect, "SELECT `blog_id`,`path` FROM `" . $prefix . "blogs`");
+
+			if ('' != $getFirstPath[0] && $baseurlpath != $getFirstPath[0]) {
+				while ($getBlogPath = mysqli_fetch_array($getBlogPathQuery)) {
+					$blogChange = str_replace($getFirstPath[0], $baseurlpath, $getBlogPath['path']);
+					mysqli_query($connect, "UPDATE `" . $prefix . "blogs` SET `path`='" . $blogChange . "' WHERE `blog_id` = " . $getBlogPath['blog_id']);
+				}
+			}
+			$delLang = mysqli_query($connect, "DELETE FROM `" . $prefix . "sitemeta` WHERE meta_key = 'WPLANG'");
+		}
+		$sqlCheck = mysqli_query($connect, "SELECT * FROM information_schema.tables WHERE TABLE_SCHEMA = '" . $dbName . "'");
+		$pattern = preg_quote('options', '/');
+		$pattern = "/^.*$pattern.*\$/m";
+		while ($datas = mysqli_fetch_array($sqlCheck)) {
+			if (preg_match_all($pattern, $datas['TABLE_NAME'], $matches)) {
+				$table = implode("\n", $matches[0]);
+				$select = mysqli_query($connect, "SELECT option_value FROM " . $table . " WHERE option_name = 'WPLANG'");
+				if ($select && mysqli_num_rows($select)) {
+					mysqli_query($connect, "UPDATE " . $table ." SET `option_value`='" . $locale . "' WHERE  `option_name`='WPLANG'");
+				} else {
+					mysqli_query($connect, "INSERT INTO " . $table ." (option_name, option_value) VALUES ('WPLANG', '" . $locale . "')");
+				}
+			}
+		}
+	}
+
+	// Replace defined values in wp-config.php
+	$baseurlpath = '/' . $baseurlpath . '/';
+	$fileContent = file_get_contents($wpConfig);
+	$searchfor = array('AUTH_KEY', 'SECURE_AUTH_KEY', 'LOGGED_IN_KEY', 'NONCE_KEY', 'AUTH_SALT', 'SECURE_AUTH_SALT', 'LOGGED_IN_SALT', 'NONCE_SALT', 'PATH_CURRENT_SITE', 'DB_USER', 'DB_PASSWORD');
+	$replaces = array($authkey, $secureauthkey, $loggedinkey, $noncekey, $authsalt, $secureauthsalt, $loggedinsalt, $noncesalt, $baseurlpath, $dbUser, $dbPassword);
+
+	foreach ($searchfor as $key => $searchVal) {
+		$fileContent = preg_replace("|^define *\(\'" . $searchVal . "\' *\, *\'.*?\'\)\;$|ms", "define('" . $searchVal . "',       '" . $replaces[$key] . "');", $fileContent);
+	}
+
+	return file_put_contents($wpConfig, $fileContent);
+}
+
+function file_intersperse_contents_update($wpConfig, $authkey, $secureauthkey, $loggedinkey, $noncekey, $authsalt, $secureauthsalt, $loggedinsalt, $noncesalt) {
+	// Replace defined values in wp-config.php
+	$fileContent = file_get_contents($wpConfig);
+	$searchfor = array('AUTH_KEY', 'SECURE_AUTH_KEY', 'LOGGED_IN_KEY', 'NONCE_KEY', 'AUTH_SALT', 'SECURE_AUTH_SALT', 'LOGGED_IN_SALT', 'NONCE_SALT');
+	$replaces = array($authkey, $secureauthkey, $loggedinkey, $noncekey, $authsalt, $secureauthsalt, $loggedinsalt, $noncesalt);
+
+	foreach ($searchfor as $key=> $searchVal) {
+		$fileContent = preg_replace("|^define\(\'" . $searchVal . "\' *\, *\'.*?\'\)\;$|ms", "define('" . $searchVal . "',       '" . $replaces[$key] . "');", $fileContent);
+	}
+
+	return file_put_contents($wpConfig, $fileContent);
+}
+
+function fixWpFilesPermission($webRoot)
+{
+    // https://jira.plesk.ru/browse/APSI-565
+    $hdl = getenv('PHP_HANDLER_TYPE');
+    if ($hdl && 'module' != $hdl) {
+        chmod($webRoot . '/wp-config.php', 0600);
+    }
+}
